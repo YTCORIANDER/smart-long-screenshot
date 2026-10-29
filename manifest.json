@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Smart Long Screenshot",
-  "version": "1.0.16",
+  "version": "1.0.23",
   "description": "Capture long screenshots of pages and nested scrollable containers.",
   "permissions": [
     "activeTab",

@@ -60,10 +60,12 @@ function reportStatus(text) {
  *   'init'   - pick the scrollable element, reset it to the top, return geometry
  *   'breaks' - list candidate page-break positions (used for PDF pagination)
  *   'move'   - scroll the element to `requested`
+ *   'probe'  - detect scroll-pinned elements once (by scroll-invariance)
+ *   'hide'   - hide every pinned/sticky/fixed element (re-run each frame)
  *   'read'   - report current scroll position and geometry
  *   'finish' - restore the original scroll position and clear state
  *
- * @param {'init'|'breaks'|'move'|'read'|'finish'} action
+ * @param {'init'|'breaks'|'move'|'probe'|'hide'|'read'|'finish'} action
  * @param {'auto'|'page'} mode
  * @param {number} [requested] - target scrollTop for the 'move' action
  */
@@ -97,10 +99,14 @@ function pageScript(action, mode, requested = 0) {
       return visibleWidth * visibleHeight + scrollableAmount * 30;
     };
 
+    // Prefer GitLab's actual wiki content scroller over the sidebar.
+    const gitlabContent = document.querySelector('.panel-content-inner.js-static-panel-inner');
+    const validGitlabContent = gitlabContent && candidates.includes(gitlabContent);
+
     const target =
       mode === 'page'
         ? scrollRoot
-        : candidates.sort((a, b) => score(b) - score(a))[0] || scrollRoot;
+        : (validGitlabContent ? gitlabContent : candidates.sort((a, b) => score(b) - score(a))[0]) || scrollRoot;
 
     // Clip to the on-screen region of the chosen element.
     const rect = isRoot(target)
@@ -108,30 +114,30 @@ function pageScript(action, mode, requested = 0) {
       : target.getBoundingClientRect();
     const clip = {
       left: Math.max(0, rect.left),
-      top: Math.max(0, rect.top),
+      top: Math.max(0, rect.top + (isRoot(target) ? 0 : 6)),
       right: Math.min(innerWidth, rect.right),
-      bottom: Math.min(innerHeight, rect.bottom),
+      bottom: Math.min(innerHeight, rect.bottom - (isRoot(target) ? 0 : 6)),
     };
     if (clip.right - clip.left < 20 || clip.bottom - clip.top < 20) {
       throw new Error('Scrollable content is not visible.');
     }
 
-    // Neutralize sticky/fixed elements so they scroll away with the content
-    // instead of staying pinned and being captured in every frame (which would
-    // both duplicate them and hide the content they overlap).
-    const neutralized = [];
-    for (const node of document.querySelectorAll('*')) {
-      const position = getComputedStyle(node).position;
-      if (position !== 'sticky' && position !== 'fixed') continue;
+    // Track hidden floating elements so they can be restored in 'finish'.
+    // The actual hiding happens in the 'hide' action, which is re-run before
+    // every frame because many sites re-show these elements on scroll.
+    window[STATE_KEY] = { el: target, original: target.scrollTop, clip, hidden: new Map() };
 
-      const rect = node.getBoundingClientRect();
-      if (rect.width < 1 || rect.height < 1) continue;
-
-      neutralized.push({ node, position: node.style.position });
-      node.style.setProperty('position', 'static', 'important');
-    }
-
-    window[STATE_KEY] = { el: target, original: target.scrollTop, clip, neutralized };
+    // A persistent CSS rule also hides headers created after scrolling.
+    const style = document.createElement('style');
+    style.id = 'sls-capture-style';
+    style.textContent = `
+      [data-testid="wiki-sticky-header"] { display: none !important; }
+      .panels-container { border-top: 0 !important; border-bottom: 0 !important; box-shadow: none !important; }
+      .panel-content-inner.js-static-panel-inner { box-shadow: none !important; }
+      .top-scrim-wrapper, .bottom-scrim-wrapper { box-shadow: none !important; border: 0 !important; }
+    `;
+    document.getElementById(style.id)?.remove();
+    document.documentElement.appendChild(style);
     target.scrollTop = 0;
     if (isRoot(target)) window.scrollTo(window.scrollX, 0);
 
@@ -154,8 +160,8 @@ function pageScript(action, mode, requested = 0) {
       const rect = node.getBoundingClientRect();
       if (rect.height < 2 || rect.width < 2) continue;
 
-      const top = rect.top - rootOffset + el.scrollTop;
-      const bottom = rect.bottom - rootOffset + el.scrollTop;
+      const top = rect.top - rootOffset + el.scrollTop - (state.clip.top - Math.max(0, el.getBoundingClientRect().top));
+      const bottom = rect.bottom - rootOffset + el.scrollTop - (state.clip.top - Math.max(0, el.getBoundingClientRect().top));
       if (bottom < 0 || top > el.scrollHeight) continue;
 
       // Protect "indivisible" blocks with a higher priority.
@@ -170,6 +176,84 @@ function pageScript(action, mode, requested = 0) {
     return true;
   }
 
+  if (action === 'probe') {
+    // Detect "visually pinned" elements by scroll-invariance, not just by CSS
+    // `position`. Some sites pin a bar with transforms, absolute positioning
+    // + JS, or a pinned ancestor; those slip past a position-only check and
+    // leave a thin repeated line at every seam. We measure each candidate's
+    // on-screen top before and after a small scroll: if it barely moves while
+    // the content moves by `delta`, it is pinned and should be hidden.
+    const root = el;
+    const beforeTop = root.scrollTop;
+    const delta = Math.min(120, Math.max(40, Math.round(root.clientHeight * 0.2)));
+
+    const candidates = [...document.querySelectorAll('*')].filter((node) => {
+      const rect = node.getBoundingClientRect();
+      // Must be wide, short-ish (bars/lines), and on screen. Height cap keeps
+      // us from flagging the main content column.
+      return (
+        rect.width >= 120 &&
+        rect.height >= 1 &&
+        rect.height <= root.clientHeight * 0.5 &&
+        rect.bottom > 0 &&
+        rect.top < innerHeight
+      );
+    });
+
+    const before = new Map(candidates.map((n) => [n, n.getBoundingClientRect().top]));
+    root.scrollTop = beforeTop + delta;
+    // Force layout so the second measurement reflects the new scroll position.
+    void root.scrollTop;
+    const moved = Math.abs(root.scrollTop - beforeTop) || delta;
+
+    state.pinned = state.pinned || new Set();
+    for (const node of candidates) {
+      const after = node.getBoundingClientRect().top;
+      const shift = Math.abs(after - before.get(node));
+      // Pinned if it moved far less than the content did.
+      if (shift < moved * 0.25) state.pinned.add(node);
+    }
+
+    root.scrollTop = beforeTop;
+    void root.scrollTop;
+    return state.pinned.size;
+  }
+
+  if (action === 'hide') {
+    // Keep the persistent rule active throughout the capture.
+    if (!document.getElementById('sls-capture-style')) {
+      const style = document.createElement('style');
+      style.id = 'sls-capture-style';
+      style.textContent = `
+      [data-testid="wiki-sticky-header"] { display: none !important; }
+      .panels-container { border-top: 0 !important; border-bottom: 0 !important; box-shadow: none !important; }
+      .panel-content-inner.js-static-panel-inner { box-shadow: none !important; }
+      .top-scrim-wrapper, .bottom-scrim-wrapper { box-shadow: none !important; border: 0 !important; }
+    `;
+      document.documentElement.appendChild(style);
+    }
+    // Hide everything that is pinned: anything flagged by 'probe' plus anything
+    // currently computed as sticky/fixed. Re-run each frame because sites
+    // re-show these on scroll. We remember each element's original inline
+    // `visibility` the first time we touch it so 'finish' can restore it.
+    const shouldHide = (node) => {
+      if (state.pinned && state.pinned.has(node)) return true;
+      const position = getComputedStyle(node).position;
+      if (position !== 'sticky' && position !== 'fixed') return false;
+      const rect = node.getBoundingClientRect();
+      return rect.width >= 1 && rect.height >= 1;
+    };
+
+    let count = 0;
+    for (const node of document.querySelectorAll('*')) {
+      if (!shouldHide(node)) continue;
+      if (!state.hidden.has(node)) state.hidden.set(node, node.style.visibility);
+      node.style.setProperty('visibility', 'hidden', 'important');
+      count++;
+    }
+    return count;
+  }
+
   if (action === 'read') {
     return {
       scroll: el.scrollTop,
@@ -181,11 +265,13 @@ function pageScript(action, mode, requested = 0) {
   }
 
   if (action === 'finish') {
-    // Restore the inline `position` of every element we neutralized.
-    for (const { node, position } of state.neutralized || []) {
-      if (position) node.style.setProperty('position', position);
-      else node.style.removeProperty('position');
+    // Restore the original inline `visibility` of every element we hid.
+    for (const [node, visibility] of state.hidden || []) {
+      if (visibility) node.style.setProperty('visibility', visibility);
+      else node.style.removeProperty('visibility');
     }
+    // Remove the capture-only rule and let GitLab manage its own toolbar.
+    document.getElementById('sls-capture-style')?.remove();
     el.scrollTop = state.original;
     delete window[STATE_KEY];
     return true;
@@ -197,7 +283,7 @@ function pageScript(action, mode, requested = 0) {
 // ---------------------------------------------------------------------------
 
 /** Maximum number of scroll-and-capture iterations (safety cap). */
-const MAX_FRAMES = 60;
+const MAX_FRAMES = 240;
 /** Minimum delay between visible-tab captures to respect Chrome's rate limit. */
 const MIN_CAPTURE_INTERVAL = 650;
 
@@ -214,6 +300,9 @@ async function captureTab(tabId, mode, job) {
   try {
     await runInPage(tabId, pageScript, ['init', mode]);
     initialized = true;
+    // Detect scroll-pinned elements once, then hide them before the first frame.
+    await runInPage(tabId, pageScript, ['probe', mode]);
+    await runInPage(tabId, pageScript, ['hide', mode]);
     await pause(250);
 
     // Page-break hints are only needed for the PDF path.
@@ -229,6 +318,11 @@ async function captureTab(tabId, mode, job) {
 
       await runInPage(tabId, pageScript, ['move', mode, nextScroll]);
       await pause(350);
+
+      // Re-hide floating elements the site may have re-shown during the scroll,
+      // then give the page a moment to repaint before capturing.
+      await runInPage(tabId, pageScript, ['hide', mode]);
+      await pause(60);
 
       const info = await runInPage(tabId, pageScript, ['read', mode]);
 
@@ -437,11 +531,16 @@ async function encodeSmartPDF(frames, elements, job) {
     ctx.fillStyle = '#ffffff';
     ctx.fillRect(0, 0, width, pageSlice);
 
-    // Composite every frame that overlaps this page's vertical range.
-    for (const frame of frames) {
+    // Use exactly one source frame for each output row. A later frame must
+    // never paint over an earlier frame's already-committed pixels.
+    for (let frameIndex = 0; frameIndex < frames.length; frameIndex++) {
+      const frame = frames[frameIndex];
       const frameTop = Math.round((frame.scroll - first.scroll) * scale);
+      const nextTop = frameIndex + 1 < frames.length
+        ? Math.round((frames[frameIndex + 1].scroll - first.scroll) * scale)
+        : totalHeight;
       const intersectTop = Math.max(top, frameTop);
-      const intersectBottom = Math.min(bottom, frameTop + frameHeight);
+      const intersectBottom = Math.min(bottom, frameTop + frameHeight, nextTop);
       if (intersectBottom <= intersectTop) continue;
 
       const bitmap = await decodeFrame(frame.data);
@@ -602,11 +701,29 @@ async function encodeContinuousPNG(frames, job) {
 
       const frame = frames[i];
       const offset = Math.round((frame.scroll - first.scroll) * scale);
+      const isLast = i === frames.length - 1;
 
-      // Skip rows already written by the previous (overlapping) frame.
-      const overlap = Math.max(0, writtenRows - offset);
-      const startRow = Math.min(regionHeight, overlap);
-      const rows = Math.min(regionHeight - startRow, totalHeight - writtenRows);
+      // Output rows are written strictly top-to-bottom and continuously,
+      // always starting at `writtenRows`. This frame covers output rows
+      // [offset, offset + regionHeight). We write the part of it that begins
+      // at `writtenRows`, so seams are always flush — never a black gap.
+      //
+      //   startRow (this frame's source row aligned to writtenRows)
+      //     = writtenRows - offset, clamped to [0, regionHeight]
+      //     > 0 : normal overlap with the previous frame -> skip repeated rows
+      //     < 0 : the scroll jumped past what the previous frame covered
+      //           (a gap). Clamping to 0 means we keep writing from the top of
+      //           this frame, filling the gap with real content instead of
+      //           leaving unwritten black rows.
+      const startRow = Math.min(regionHeight, Math.max(0, writtenRows - offset));
+
+      // Hand off to the next frame at its `offset` so we don't write the
+      // overlap twice; the last frame writes everything down to totalHeight.
+      const outputEnd = isLast
+        ? totalHeight
+        : Math.min(offset + regionHeight, Math.round((frames[i + 1].scroll - first.scroll) * scale));
+
+      const rows = Math.min(regionHeight - startRow, outputEnd - writtenRows);
       if (rows <= 0) continue;
 
       const bitmap = await decodeFrame(frame.data);
