@@ -48,6 +48,19 @@ function reportStatus(text) {
   return chrome.storage.local.set({ captureStatus: text });
 }
 
+/** Publish an overall percentage that includes capture and PNG encoding. */
+function reportProgress(percent, phase, detail) {
+  return chrome.storage.local.set({
+    captureProgress: {
+      percent: Math.max(0, Math.min(100, Math.round(percent))),
+      phase,
+      detail,
+      updatedAt: Date.now()
+    },
+    captureStatus: detail
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Injected page script
 // ---------------------------------------------------------------------------
@@ -125,7 +138,7 @@ function pageScript(action, mode, requested = 0) {
     // Track hidden floating elements so they can be restored in 'finish'.
     // The actual hiding happens in the 'hide' action, which is re-run before
     // every frame because many sites re-show these elements on scroll.
-    window[STATE_KEY] = { el: target, original: target.scrollTop, clip, hidden: new Map() };
+    window[STATE_KEY] = { el: target, original: target.scrollTop, clip, hidden: new Map(), githubHeaders: new Map() };
 
     // A persistent CSS rule also hides headers created after scrolling.
     const style = document.createElement('style');
@@ -219,6 +232,46 @@ function pageScript(action, mode, requested = 0) {
     return state.pinned.size;
   }
 
+  if (action === 'github-headers') {
+    // Disable GitHub's floating Code / Blame toolbar instead of hiding it.
+    // Visibility:hidden leaves the sticky overlay occupying screen space and
+    // can conceal source lines behind a blank rectangle.
+    if (location.hostname !== 'github.com') return 0;
+
+    const controls = [...document.querySelectorAll('button, a, [role="tab"]')]
+      .filter(node => /^(Code|Blame)$/.test((node.textContent || '').trim()));
+    const code = controls.find(node => node.textContent.trim() === 'Code');
+    const blame = controls.find(node => node.textContent.trim() === 'Blame');
+    if (!code || !blame) return 0;
+
+    let bar = code;
+    while (bar && !bar.contains(blame)) bar = bar.parentElement;
+    if (!bar) return 0;
+
+    // Keep the toolbar in normal document flow so it appears only once.
+    // Include compact sticky ancestors, but never modify the entire file view.
+    const candidates = [bar];
+    let ancestor = bar.parentElement;
+    for (let i = 0; ancestor && i < 5; i++, ancestor = ancestor.parentElement) {
+      const rect = ancestor.getBoundingClientRect();
+      if (rect.height > 125) break;
+      candidates.push(ancestor);
+    }
+
+    let count = 0;
+    for (const node of candidates) {
+      const computed = getComputedStyle(node);
+      if (computed.position !== 'sticky' && computed.position !== 'fixed') continue;
+      if (!state.githubHeaders.has(node)) state.githubHeaders.set(node, node.getAttribute('style'));
+      node.style.setProperty('position', 'static', 'important');
+      node.style.setProperty('top', 'auto', 'important');
+      node.style.setProperty('bottom', 'auto', 'important');
+      node.style.setProperty('transform', 'none', 'important');
+      count++;
+    }
+    return count;
+  }
+
   if (action === 'hide') {
     // Keep the persistent rule active throughout the capture.
     if (!document.getElementById('sls-capture-style')) {
@@ -237,6 +290,7 @@ function pageScript(action, mode, requested = 0) {
     // re-show these on scroll. We remember each element's original inline
     // `visibility` the first time we touch it so 'finish' can restore it.
     const shouldHide = (node) => {
+      if (state.githubHeaders && state.githubHeaders.has(node)) return false;
       if (state.pinned && state.pinned.has(node)) return true;
       const position = getComputedStyle(node).position;
       if (position !== 'sticky' && position !== 'fixed') return false;
@@ -270,6 +324,11 @@ function pageScript(action, mode, requested = 0) {
       if (visibility) node.style.setProperty('visibility', visibility);
       else node.style.removeProperty('visibility');
     }
+    // Restore GitHub file toolbar styles after the screenshot is complete.
+    for (const [node, originalStyle] of state.githubHeaders || []) {
+      if (originalStyle === null) node.removeAttribute('style');
+      else node.setAttribute('style', originalStyle);
+    }
     // Remove the capture-only rule and let GitLab manage its own toolbar.
     document.getElementById('sls-capture-style')?.remove();
     el.scrollTop = state.original;
@@ -302,13 +361,15 @@ async function captureTab(tabId, mode, job) {
     initialized = true;
     // Detect scroll-pinned elements once, then hide them before the first frame.
     await runInPage(tabId, pageScript, ['probe', mode]);
+    await runInPage(tabId, pageScript, ['github-headers', mode]);
     await runInPage(tabId, pageScript, ['hide', mode]);
     await pause(250);
 
     // Page-break hints are only needed for the PDF path.
-    const breakHints = job.format === 'pdf' ? await runInPage(tabId, pageScript, ['breaks', mode]) : [];
+    const breakHints = await runInPage(tabId, pageScript, ['breaks', mode]);
 
     const frames = [];
+    await reportProgress(1, 'Capturing', 'Preparing scrollable content...');
     let lastScroll = -1;
     let nextScroll = 0;
     let lastCaptureAt = 0;
@@ -321,6 +382,7 @@ async function captureTab(tabId, mode, job) {
 
       // Re-hide floating elements the site may have re-shown during the scroll,
       // then give the page a moment to repaint before capturing.
+      await runInPage(tabId, pageScript, ['github-headers', mode]);
       await runInPage(tabId, pageScript, ['hide', mode]);
       await pause(60);
 
@@ -339,8 +401,13 @@ async function captureTab(tabId, mode, job) {
       frames.push({ data, ...info });
       lastScroll = info.scroll;
 
-      await reportStatus(
-        `Captured ${frames.length} section(s), scroll ${Math.round(info.scroll)} px`
+
+      const maxScroll = Math.max(0, info.height - info.view);
+      const covered = maxScroll ? Math.min(1, info.scroll / maxScroll) : 1;
+      await reportProgress(
+        2 + covered * 78,
+        'Capturing',
+        `Capturing section ${frames.length} · ${Math.round(covered * 100)}% of page`
       );
 
       // Stop once the bottom of the content is on screen.
@@ -348,15 +415,13 @@ async function captureTab(tabId, mode, job) {
 
       // Advance by ~65% of the visible region for a comfortable overlap.
       const visible = Math.min(info.view, info.clip.bottom - info.clip.top);
-      const step = Math.max(50, Math.floor(visible * 0.65));
+      const step = Math.max(50, Math.floor(visible * 0.45));
       nextScroll = info.scroll + step;
     }
 
     if (!frames.length) throw new Error('No frames captured.');
 
-    return job.format === 'pdf'
-      ? await finishAsPDF(frames, breakHints, job)
-      : await finishAsPNG(frames, job);
+    return await finishAsPNG(frames, breakHints, job);
   } finally {
     if (initialized) {
       try {
@@ -368,40 +433,40 @@ async function captureTab(tabId, mode, job) {
   }
 }
 
-/** Build a PDF from the captured frames and trigger the download. */
+/** Persist the completed capture and open a review tab without downloading. */
+async function showPreview(blob, format, frameCount, frames, breakHints) {
+  await reportProgress(99, 'Preparing preview', 'Opening preview...');
+  await new Promise((resolve, reject) => {
+    const request = indexedDB.open('smart-long-screenshot-preview', 1);
+    request.onupgradeneeded = () => request.result.createObjectStore('captures');
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => {
+      const db = request.result;
+      const tx = db.transaction('captures', 'readwrite');
+      tx.objectStore('captures').put({ blob, format, frames, breakHints, created: Date.now() }, 'latest');
+      tx.oncomplete = () => { db.close(); resolve(); };
+      tx.onerror = () => { db.close(); reject(tx.error); };
+    };
+  });
+  await chrome.tabs.create({ url: chrome.runtime.getURL('preview.html') });
+  await reportProgress(100, 'Complete', 'Preview ready — choose PNG or PDF.');
+  return { ok: true, frames: frameCount, parts: 1, images: 1, format: format.toUpperCase() };
+}
+
+/** Build a PDF and show it in the review tab. */
 async function finishAsPDF(frames, breakHints, job) {
   await reportStatus('Building smart-paginated PDF...');
   const pdf = await encodeSmartPDF(frames, breakHints, job);
-
-  const url = await blobToDataURL(pdf);
-  const downloadId = await chrome.downloads.download({
-    url,
-    filename: `long-screenshot-${Date.now()}.pdf`,
-    saveAs: false,
-    conflictAction: 'uniquify',
-  });
-  if (downloadId === undefined) throw new Error('Chrome did not start the PDF download.');
-
-  return { ok: true, frames: frames.length, parts: 1, images: 1, format: 'PDF' };
+  if (job.cancel) throw new Error('Capture stopped.');
+  return showPreview(pdf, 'pdf', frames.length);
 }
 
-/** Build one continuous PNG from the captured frames and trigger the download. */
-async function finishAsPNG(frames, job) {
-  await reportStatus('Encoding one continuous PNG...');
+/** Build one continuous PNG and show it in the review tab. */
+async function finishAsPNG(frames, breakHints, job) {
+  await reportProgress(82, 'Encoding PNG', 'Stitching captured sections...');
   const png = await encodeContinuousPNG(frames, job);
   if (job.cancel) throw new Error('Capture stopped.');
-
-  await reportStatus('Saving one PNG...');
-  const url = await blobToDataURL(png);
-  const downloadId = await chrome.downloads.download({
-    url,
-    filename: `long-screenshot-${Date.now()}.png`,
-    saveAs: false,
-    conflictAction: 'uniquify',
-  });
-  if (downloadId === undefined) throw new Error('Chrome did not start the PNG download.');
-
-  return { ok: true, frames: frames.length, parts: 1, images: 1 };
+  return showPreview(png, 'png', frames.length, frames, breakHints);
 }
 
 // ---------------------------------------------------------------------------
@@ -483,6 +548,29 @@ function choosePageBreaks(totalHeight, pageHeight, elements, scale) {
  * @param {Array} elements - page-break hints from the page script
  * @param {{cancel: boolean}} job
  */
+// Choose stitch boundaries inside each overlap, away from sticky headers.
+// The earlier frame supplies the upper overlap; the later frame supplies
+// only pixels well below its viewport top, where sticky bars may obscure text.
+function computeStitchBoundaries(frames, scale, regionHeight) {
+  const firstScroll = frames[0].scroll;
+  const positions = frames.map(frame => Math.round((frame.scroll - firstScroll) * scale));
+  const seams = [0];
+  for (let i = 0; i < positions.length - 1; i++) {
+    const nextTop = positions[i + 1];
+    const currentBottom = positions[i] + regionHeight;
+    const overlap = currentBottom - nextTop;
+    if (overlap < 8) {
+      throw new Error('Insufficient frame overlap to avoid obscured content.');
+    }
+    // Prefer the last 25% of the overlap from the previous frame.
+    // This skips the top 75% of the next frame's overlap, including headers.
+    const seam = nextTop + Math.floor(overlap * 0.75);
+    seams.push(Math.max(seams.at(-1), Math.min(seam, currentBottom - 1)));
+  }
+  seams.push(positions.at(-1) + regionHeight);
+  return seams;
+}
+
 async function encodeSmartPDF(frames, elements, job) {
   const first = frames[0];
   const scale = first.dpr || 1;
@@ -492,6 +580,7 @@ async function encodeSmartPDF(frames, elements, job) {
   const frameHeight = Math.round((clip.bottom - clip.top) * scale);
   const totalHeight = Math.round((frames.at(-1).scroll - first.scroll) * scale) + frameHeight;
 
+  const seams = computeStitchBoundaries(frames, scale, frameHeight);
   const pageHeight = Math.max(100, Math.floor((width * A4_HEIGHT) / A4_WIDTH));
   const boundaries = choosePageBreaks(totalHeight, pageHeight, elements, scale);
 
@@ -536,11 +625,8 @@ async function encodeSmartPDF(frames, elements, job) {
     for (let frameIndex = 0; frameIndex < frames.length; frameIndex++) {
       const frame = frames[frameIndex];
       const frameTop = Math.round((frame.scroll - first.scroll) * scale);
-      const nextTop = frameIndex + 1 < frames.length
-        ? Math.round((frames[frameIndex + 1].scroll - first.scroll) * scale)
-        : totalHeight;
-      const intersectTop = Math.max(top, frameTop);
-      const intersectBottom = Math.min(bottom, frameTop + frameHeight, nextTop);
+      const intersectTop = Math.max(top, seams[frameIndex]);
+      const intersectBottom = Math.min(bottom, seams[frameIndex + 1]);
       if (intersectBottom <= intersectTop) continue;
 
       const bitmap = await decodeFrame(frame.data);
@@ -671,6 +757,7 @@ async function encodeContinuousPNG(frames, job) {
   const width = Math.round((clip.right - clip.left) * scale);
   const regionHeight = Math.round((clip.bottom - clip.top) * scale);
   const totalHeight = Math.round((frames.at(-1).scroll - first.scroll) * scale) + regionHeight;
+  const seams = computeStitchBoundaries(frames, scale, regionHeight);
   if (width <= 0 || totalHeight <= 0 || totalHeight > 0x7fffffff) {
     throw new Error('Invalid image dimensions.');
   }
@@ -701,27 +788,11 @@ async function encodeContinuousPNG(frames, job) {
 
       const frame = frames[i];
       const offset = Math.round((frame.scroll - first.scroll) * scale);
-      const isLast = i === frames.length - 1;
 
-      // Output rows are written strictly top-to-bottom and continuously,
-      // always starting at `writtenRows`. This frame covers output rows
-      // [offset, offset + regionHeight). We write the part of it that begins
-      // at `writtenRows`, so seams are always flush — never a black gap.
-      //
-      //   startRow (this frame's source row aligned to writtenRows)
-      //     = writtenRows - offset, clamped to [0, regionHeight]
-      //     > 0 : normal overlap with the previous frame -> skip repeated rows
-      //     < 0 : the scroll jumped past what the previous frame covered
-      //           (a gap). Clamping to 0 means we keep writing from the top of
-      //           this frame, filling the gap with real content instead of
-      //           leaving unwritten black rows.
-      const startRow = Math.min(regionHeight, Math.max(0, writtenRows - offset));
-
-      // Hand off to the next frame at its `offset` so we don't write the
-      // overlap twice; the last frame writes everything down to totalHeight.
-      const outputEnd = isLast
-        ? totalHeight
-        : Math.min(offset + regionHeight, Math.round((frames[i + 1].scroll - first.scroll) * scale));
+      // Use the same overlap-safe seams as PDF rendering.
+      // Later frames begin well below their sticky-header region.
+      const startRow = Math.max(0, seams[i] - offset);
+      const outputEnd = seams[i + 1];
 
       const rows = Math.min(regionHeight - startRow, outputEnd - writtenRows);
       if (rows <= 0) continue;
@@ -756,7 +827,7 @@ async function encodeContinuousPNG(frames, job) {
         bitmap.close();
       }
 
-      await reportStatus(`Encoding one PNG: ${i + 1}/${frames.length} sections`);
+      await reportProgress(82 + (i + 1) / frames.length * 16, 'Encoding PNG', `Stitching image: ${i + 1}/${frames.length} sections`);
     }
 
     if (writtenRows !== totalHeight) {
@@ -809,6 +880,35 @@ async function blobToDataURL(blob) {
 // Message router
 // ---------------------------------------------------------------------------
 
+// Convert the saved raw screenshot frames into a smart-paginated A4 PDF on demand.
+async function exportPreviewPDF() {
+  const record = await new Promise((resolve, reject) => {
+    const request = indexedDB.open('smart-long-screenshot-preview', 1);
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => {
+      const db = request.result;
+      const tx = db.transaction('captures', 'readonly');
+      const get = tx.objectStore('captures').get('latest');
+      get.onsuccess = () => { db.close(); resolve(get.result); };
+      get.onerror = () => { db.close(); reject(get.error); };
+    };
+  });
+  if (!record?.frames?.length) throw new Error('No captured frames available. Capture the page again.');
+  const pdf = await encodeSmartPDF(record.frames, record.breakHints || [], { cancel: false });
+  await new Promise((resolve, reject) => {
+    const request = indexedDB.open('smart-long-screenshot-preview', 1);
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => {
+      const db = request.result;
+      const tx = db.transaction('captures', 'readwrite');
+      tx.objectStore('captures').put({ ...record, pdfBlob: pdf }, 'latest');
+      tx.oncomplete = () => { db.close(); resolve(); };
+      tx.onerror = () => { db.close(); reject(tx.error); };
+    };
+  });
+  return { ok: true };
+}
+
 chrome.runtime.onMessage.addListener((msg, _sender, respond) => {
   if (msg.type === 'STOP') {
     for (const job of jobs.values()) job.cancel = true;
@@ -816,6 +916,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, respond) => {
     return;
   }
 
+  if (msg.type === 'EXPORT_PDF') {
+    exportPreviewPDF().then(respond).catch(error => respond({ ok: false, error: error.message }));
+    return true;
+  }
   if (msg.type !== 'START') return;
 
   if (jobs.has(msg.tabId)) {
@@ -823,17 +927,17 @@ chrome.runtime.onMessage.addListener((msg, _sender, respond) => {
     return;
   }
 
-  const job = { cancel: false, format: msg.format || 'png' };
+  const job = { cancel: false, format: 'png' };
   jobs.set(msg.tabId, job);
-  reportStatus('Starting capture...');
+  reportProgress(0, 'Starting', 'Starting capture...');
 
   captureTab(msg.tabId, msg.mode, job)
     .then((result) => {
-      reportStatus('Done!');
+      reportProgress(100, 'Complete', 'Preview ready — choose PNG or PDF.');
       respond(result);
     })
     .catch((err) => {
-      reportStatus('Error: ' + err.message);
+      reportProgress(0, err.message === 'Capture stopped.' ? 'Stopped' : 'Error', 'Error: ' + err.message);
       respond({ ok: false, error: err.message });
     })
     .finally(() => jobs.delete(msg.tabId));

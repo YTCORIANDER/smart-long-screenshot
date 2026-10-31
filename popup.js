@@ -3,7 +3,22 @@
 // shared capture status (persisted in chrome.storage.local) into the view.
 
 const statusEl = document.getElementById('status');
-const pdfCheckbox = document.getElementById('pdf');
+const progressWrap = document.getElementById('progressWrap');
+const progressFill = document.getElementById('progressFill');
+const progressPercent = document.getElementById('progressPercent');
+const progressPhase = document.getElementById('progressPhase');
+
+/** Update the visual progress indicator and accessibility attributes. */
+function setProgress(progress) {
+  if (!progress) return;
+  const value = Math.max(0, Math.min(100, Number(progress.percent) || 0));
+  progressFill.style.width = `${value}%`;
+  progressPercent.textContent = `${Math.round(value)}%`;
+  progressPhase.textContent = progress.phase || 'Capturing';
+  progressWrap.dataset.phase = progress.phase || '';
+  progressWrap.setAttribute('aria-valuenow', String(Math.round(value)));
+  if (progress.detail) setStatus(progress.detail);
+}
 
 /**
  * Show a message in the status line.
@@ -14,13 +29,15 @@ function setStatus(text) {
 }
 
 // Restore the last known status when the popup opens.
-chrome.storage.local.get('captureStatus').then(({ captureStatus }) => {
+chrome.storage.local.get(['captureStatus', 'captureProgress']).then(({ captureStatus, captureProgress }) => {
   if (captureStatus) setStatus(captureStatus);
+  if (captureProgress) setProgress(captureProgress);
 });
 
 // Keep the status line in sync while the popup stays open.
 chrome.storage.onChanged.addListener((changes) => {
   if (changes.captureStatus) setStatus(changes.captureStatus.newValue);
+  if (changes.captureProgress) setProgress(changes.captureProgress.newValue);
 });
 
 /**
@@ -29,22 +46,20 @@ chrome.storage.onChanged.addListener((changes) => {
  *                               'page' captures the main document.
  */
 async function startCapture(mode) {
-  setStatus('Starting... Keep the page visible and do not scroll.');
+  setProgress({ percent: 0, phase: 'Starting', detail: 'Starting... Keep the page visible and do not scroll.' });
 
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    const format = pdfCheckbox.checked ? 'pdf' : 'png';
 
     const result = await chrome.runtime.sendMessage({
       type: 'START',
       tabId: tab.id,
       mode,
-      format,
     });
 
     if (!result?.ok) throw new Error(result?.error || 'Capture failed');
 
-    setStatus(`Done! ${result.format || 'PNG'} saved.`);
+    setStatus('Done! Preview opened. Choose PNG or PDF there.');
   } catch (error) {
     setStatus('Error: ' + error.message);
   }
@@ -57,5 +72,4 @@ async function stopCapture() {
 }
 
 document.getElementById('auto').onclick = () => startCapture('auto');
-document.getElementById('page').onclick = () => startCapture('page');
 document.getElementById('stop').onclick = stopCapture;

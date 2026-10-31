@@ -41,6 +41,12 @@
         color: #64748b;
       }
 
+      .progress-wrap { margin: 14px 0 8px; }
+      .progress-heading { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; font-weight: 600; margin-bottom: 7px; }
+      .progress-track { height: 10px; overflow: hidden; background: #e2e8f0; border-radius: 999px; }
+      .progress-fill { height: 100%; width: 0%; background: #2563eb; border-radius: inherit; transition: width 180ms ease; }
+      .progress-wrap[data-phase="Complete"] .progress-fill { background: #16a34a; }
+      .progress-wrap[data-phase="Error"] .progress-fill { background: #dc2626; }
       #status {
         font-size: 12px;
         color: #475569;
@@ -52,18 +58,15 @@
   <body>
     <h2>Smart Long Screenshot</h2>
 
-    <label class="option">
-      <input type="checkbox" id="pdf" />
-      Export PDF with smart page splitting (A4)
-    </label>
-
     <button id="auto">Capture Scrollable Content</button>
-    <button id="page" class="secondary">Capture Main Page</button>
-
-    <div class="hint">PNG by default; check PDF for smart page splitting.</div>
+    <div class="hint">Capture once, then export PNG or smart-split A4 PDF from Preview.</div>
 
     <button id="stop" class="secondary">Stop Capture</button>
 
+    <div class="progress-wrap" id="progressWrap" role="progressbar" aria-label="Screenshot progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+      <div class="progress-heading"><span id="progressPhase">Ready</span><span id="progressPercent">0%</span></div>
+      <div class="progress-track"><div id="progressFill" class="progress-fill"></div></div>
+    </div>
     <div id="status">Open a webpage to begin.</div>
 
     <script src="popup.js"></script>
