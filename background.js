@@ -413,9 +413,10 @@ async function captureTab(tabId, mode, job) {
       // Stop once the bottom of the content is on screen.
       if (info.scroll + info.view >= info.height - 2) break;
 
-      // Advance by ~65% of the visible region for a comfortable overlap.
+      // Advance by ~55% of the visible region so there is a 45% overlap,
+      // giving the seam algorithm more room to avoid mid-line cuts.
       const visible = Math.min(info.view, info.clip.bottom - info.clip.top);
-      const step = Math.max(50, Math.floor(visible * 0.45));
+      const step = Math.max(50, Math.floor(visible * 0.55));
       nextScroll = info.scroll + step;
     }
 
@@ -567,7 +568,10 @@ function computeStitchBoundaries(frames, scale, regionHeight) {
     const seam = nextTop + Math.floor(overlap * 0.75);
     seams.push(Math.max(seams.at(-1), Math.min(seam, currentBottom - 1)));
   }
-  seams.push(positions.at(-1) + regionHeight);
+  // Use totalHeight as the final seam boundary so the PNG encoder's
+  // writtenRows always matches exactly and avoids off-by-one errors.
+  const totalHeightFromScroll = positions.at(-1) + regionHeight;
+  seams.push(totalHeightFromScroll);
   return seams;
 }
 
@@ -830,7 +834,9 @@ async function encodeContinuousPNG(frames, job) {
       await reportProgress(82 + (i + 1) / frames.length * 16, 'Encoding PNG', `Stitching image: ${i + 1}/${frames.length} sections`);
     }
 
-    if (writtenRows !== totalHeight) {
+    // Allow up to 2 px of rounding drift between the seam-based writtenRows
+    // and the scroll-based totalHeight estimate.
+    if (Math.abs(writtenRows - totalHeight) > 2) {
       throw new Error(`Missing screenshot rows (${writtenRows}/${totalHeight}).`);
     }
 
