@@ -791,15 +791,22 @@ async function encodeContinuousPNG(frames, job) {
       if (job.cancel) throw new Error('Capture stopped.');
 
       const frame = frames[i];
-      const offset = Math.round((frame.scroll - first.scroll) * scale);
+      // Absolute pixel offset of this frame's top row in the final image.
+      const frameAbsTop = Math.round((frame.scroll - first.scroll) * scale);
+      const frameAbsBottom = frameAbsTop + regionHeight;
 
-      // Use the same overlap-safe seams as PDF rendering.
-      // Later frames begin well below their sticky-header region.
-      const startRow = Math.max(0, seams[i] - offset);
-      const outputEnd = seams[i + 1];
+      // Absolute range this frame is responsible for (from seams).
+      const seamTop = seams[i];        // absolute start of this frame's contribution
+      const seamBottom = seams[i + 1]; // absolute end   of this frame's contribution
 
-      const rows = Math.min(regionHeight - startRow, outputEnd - writtenRows);
-      if (rows <= 0) continue;
+      // Intersect seam range with what this frame actually covers.
+      const absStart = Math.max(seamTop, frameAbsTop);
+      const absEnd   = Math.min(seamBottom, frameAbsBottom);
+      if (absEnd <= absStart) continue;
+
+      // Row indices within the frame's own pixel data.
+      const srcRowStart = absStart - frameAbsTop; // relative to frame top
+      const rows = absEnd - absStart;
 
       const bitmap = await decodeFrame(frame.data);
       try {
@@ -810,7 +817,7 @@ async function encodeContinuousPNG(frames, job) {
           0, 0, width, regionHeight
         );
 
-        const pixels = ctx.getImageData(0, startRow, width, rows).data;
+        const pixels = ctx.getImageData(0, srcRowStart, width, rows).data;
         const stride = width * 4;
 
         // Write in ~1 MB batches, prefixing each scanline with filter byte 0.
@@ -849,9 +856,11 @@ async function encodeContinuousPNG(frames, job) {
   }
 
   // IHDR: width, height, 8-bit depth, color type 6 (RGBA).
+  // Use writtenRows (actual data written) not totalHeight (scroll estimate)
+  // so the PNG header always matches the compressed data exactly.
   const header = new Uint8Array(13);
   header.set(uint32(width), 0);
-  header.set(uint32(totalHeight), 4);
+  header.set(uint32(writtenRows), 4);
   header[8] = 8;
   header[9] = 6;
 
