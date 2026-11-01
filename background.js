@@ -505,36 +505,53 @@ function choosePageBreaks(totalHeight, pageHeight, elements, scale) {
       break;
     }
 
-    // Only consider breaks in the lower ~27% of the page so pages stay full.
+    // Search for a clean break anywhere between minimum and target.
+    // If nothing is found in the lower 27%, widen the search all the way
+    // back to just after `start` — we'd rather have a shorter page with
+    // whitespace than slice through a line of text.
     const minimum = start + Math.round(pageHeight * 0.73);
-    let best = target;
+    let best = -1;       // -1 means "no candidate found yet"
     let bestScore = -Infinity;
 
+    // Helper: true when `edge` cuts through a high-priority (protected) element.
+    const cutsProtected = (edge) => elements.some((other) => {
+      const a = Math.round(other.top * scale);
+      const b = Math.round(other.bottom * scale);
+      return a + 3 < edge && edge < b - 3 && other.priority >= 3 && b - a < pageHeight;
+    });
+
+    // First pass: prefer the lower part of the page (minimum..target).
     for (const el of elements) {
       const top = Math.round(el.top * scale);
       const bottom = Math.round(el.bottom * scale);
-
       for (const edge of [top, bottom]) {
         if (edge < minimum || edge > target) continue;
-
-        // Reject edges that would cut through a protected element.
-        const cutsProtected = elements.some((other) => {
-          const a = Math.round(other.top * scale);
-          const b = Math.round(other.bottom * scale);
-          return a + 3 < edge && edge < b - 3 && other.priority >= 3 && b - a < pageHeight;
-        });
-        if (cutsProtected) continue;
-
-        // Prefer breaks at protected elements (slightly) and lower on the page.
+        if (cutsProtected(edge)) continue;
         const score = edge - (el.priority === 3 ? 0 : 8);
-        if (score > bestScore) {
-          bestScore = score;
-          best = edge;
+        if (score > bestScore) { bestScore = score; best = edge; }
+      }
+    }
+
+    // Second pass: if no clean break found in the lower 27%, search the full
+    // page range (start..target) and pick the highest safe element boundary.
+    // This leaves whitespace at the bottom of the page instead of cutting text.
+    if (best === -1) {
+      for (const el of elements) {
+        const top = Math.round(el.top * scale);
+        const bottom = Math.round(el.bottom * scale);
+        for (const edge of [top, bottom]) {
+          if (edge <= start || edge > target) continue;
+          if (cutsProtected(edge)) continue;
+          const score = edge - (el.priority === 3 ? 0 : 8);
+          if (score > bestScore) { bestScore = score; best = edge; }
         }
       }
     }
 
-    if (best <= start) best = target;
+    // Last resort: no element boundaries at all — force-cut at target.
+    // This should be extremely rare (a page with no detectable DOM elements).
+    if (best === -1) best = target;
+
     boundaries.push(best);
     start = best;
   }
