@@ -162,24 +162,36 @@ function pageScript(action, mode, requested = 0) {
   const el = state.el;
 
   if (action === 'breaks') {
-    // Collect vertical positions of content blocks so the PDF can avoid
-    // slicing through important elements (tables, images, etc.).
-    const rootOffset = isRoot(el) ? 0 : el.getBoundingClientRect().top;
-    const selector = 'p, li, tr, h1, h2, h3, h4, h5, img, svg, figure, pre, blockquote';
-    const nodes = isRoot(el) ? document.querySelectorAll(selector) : el.querySelectorAll(selector);
-
+    // Measure actual text line boxes, including text in div/span/code nodes.
+    // Coordinates share the screenshot's clipped origin, for root and nested scrolling.
+    const root = isRoot(el) ? document.body : el;
     const breaks = [];
-    for (const node of nodes) {
-      const rect = node.getBoundingClientRect();
-      if (rect.height < 2 || rect.width < 2) continue;
-
-      const top = rect.top - rootOffset + el.scrollTop - (state.clip.top - Math.max(0, el.getBoundingClientRect().top));
-      const bottom = rect.bottom - rootOffset + el.scrollTop - (state.clip.top - Math.max(0, el.getBoundingClientRect().top));
-      if (bottom < 0 || top > el.scrollHeight) continue;
-
-      // Protect "indivisible" blocks with a higher priority.
-      const priority = node.matches('tr, img, svg, figure, pre') ? 3 : 1;
-      breaks.push({ top: Math.round(top), bottom: Math.round(bottom), priority });
+    const visible = (node) => {
+      const style = getComputedStyle(node);
+      return style.display !== 'none' && style.visibility === 'visible';
+    };
+    const add = (rect, priority) => {
+      if (rect.width <= 0 || rect.height <= 0 ||
+          rect.right <= state.clip.left || rect.left >= state.clip.right ||
+          rect.bottom <= state.clip.top || rect.top >= state.clip.bottom) return;
+      breaks.push({
+        top: rect.top - state.clip.top + el.scrollTop,
+        bottom: rect.bottom - state.clip.top + el.scrollTop,
+        priority,
+      });
+    };
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    const range = document.createRange();
+    while (walker.nextNode()) {
+      const node = walker.currentNode;
+      if (!node.textContent.trim() || !visible(node.parentElement) ||
+          node.parentElement.closest('script, style, noscript')) continue;
+      range.selectNodeContents(node);
+      for (const rect of range.getClientRects()) add(rect, 4);
+    }
+    range.detach();
+    for (const node of root.querySelectorAll('tr, img, svg, figure, pre')) {
+      if (visible(node)) add(node.getBoundingClientRect(), 3);
     }
     return breaks;
   }
@@ -365,8 +377,7 @@ async function captureTab(tabId, mode, job) {
     await runInPage(tabId, pageScript, ['hide', mode]);
     await pause(250);
 
-    // Page-break hints are only needed for the PDF path.
-    const breakHints = await runInPage(tabId, pageScript, ['breaks', mode]);
+    const breakHints = []; // Per-frame hints are saved for later PDF export.
 
     const frames = [];
     await reportProgress(1, 'Capturing', 'Preparing scrollable content...');
@@ -396,9 +407,10 @@ async function captureTab(tabId, mode, job) {
       if (elapsed < MIN_CAPTURE_INTERVAL) await pause(MIN_CAPTURE_INTERVAL - elapsed);
       if (job.cancel) throw new Error('Capture stopped.');
 
+      const frameBreakHints = await runInPage(tabId, pageScript, ['breaks', mode]);
       const data = await chrome.tabs.captureVisibleTab(undefined, { format: 'png' });
       lastCaptureAt = Date.now();
-      frames.push({ data, ...info });
+      frames.push({ data, ...info, breakHints: frameBreakHints });
       lastScroll = info.scroll;
 
 
@@ -495,67 +507,43 @@ async function decodeFrame(dataUrl) {
  * @param {number} scale - device pixel ratio
  */
 function choosePageBreaks(totalHeight, pageHeight, elements, scale) {
+  const intervals = elements
+    .filter(e => Number.isFinite(e.top) && Number.isFinite(e.bottom))
+    .map(e => ({ top: Math.floor(e.top * scale), bottom: Math.ceil(e.bottom * scale), priority: e.priority }))
+    .filter(e => e.bottom > e.top);
+  const lines = intervals.filter(e => e.priority >= 4);
+  const blocks = intervals.filter(e => e.priority >= 3 && e.bottom - e.top < pageHeight);
+  // Merge overlapping boxes across columns/inline spans. A boundary is safe
+  // only when it is outside every protected box, not just one paragraph.
+  const merge = (items) => {
+    const result = [];
+    for (const item of [...items].sort((a, b) => a.top - b.top)) {
+      const last = result.at(-1);
+      if (last && item.top < last.bottom) last.bottom = Math.max(last.bottom, item.bottom);
+      else result.push({ top: item.top, bottom: item.bottom });
+    }
+    return result;
+  };
+  const protectedRuns = merge([...blocks, ...lines]);
+  const lineRuns = merge(lines);
+  const retreat = (target, runs) => {
+    const run = runs.find(r => r.top < target && target < r.bottom);
+    return run ? run.top : target;
+  };
   const boundaries = [0];
   let start = 0;
-
-  while (start < totalHeight - 1) {
+  while (start < totalHeight) {
     const target = Math.min(totalHeight, start + pageHeight);
-    if (target === totalHeight) {
-      boundaries.push(totalHeight);
-      break;
-    }
-
-    // Search for a clean break anywhere between minimum and target.
-    // If nothing is found in the lower 27%, widen the search all the way
-    // back to just after `start` — we'd rather have a shorter page with
-    // whitespace than slice through a line of text.
-    const minimum = start + Math.round(pageHeight * 0.73);
-    let best = -1;       // -1 means "no candidate found yet"
-    let bestScore = -Infinity;
-
-    // Helper: true when `edge` cuts through a high-priority (protected) element.
-    const cutsProtected = (edge) => elements.some((other) => {
-      const a = Math.round(other.top * scale);
-      const b = Math.round(other.bottom * scale);
-      return a + 3 < edge && edge < b - 3 && other.priority >= 3 && b - a < pageHeight;
-    });
-
-    // First pass: prefer the lower part of the page (minimum..target).
-    for (const el of elements) {
-      const top = Math.round(el.top * scale);
-      const bottom = Math.round(el.bottom * scale);
-      for (const edge of [top, bottom]) {
-        if (edge < minimum || edge > target) continue;
-        if (cutsProtected(edge)) continue;
-        const score = edge - (el.priority === 3 ? 0 : 8);
-        if (score > bestScore) { bestScore = score; best = edge; }
-      }
-    }
-
-    // Second pass: if no clean break found in the lower 27%, search the full
-    // page range (start..target) and pick the highest safe element boundary.
-    // This leaves whitespace at the bottom of the page instead of cutting text.
-    if (best === -1) {
-      for (const el of elements) {
-        const top = Math.round(el.top * scale);
-        const bottom = Math.round(el.bottom * scale);
-        for (const edge of [top, bottom]) {
-          if (edge <= start || edge > target) continue;
-          if (cutsProtected(edge)) continue;
-          const score = edge - (el.priority === 3 ? 0 : 8);
-          if (score > bestScore) { bestScore = score; best = edge; }
-        }
-      }
-    }
-
-    // Last resort: no element boundaries at all — force-cut at target.
-    // This should be extremely rare (a page with no detectable DOM elements).
-    if (best === -1) best = target;
-
+    if (target === totalHeight) { boundaries.push(target); break; }
+    let best = retreat(target, protectedRuns);
+    // A long code block/table may span pages: preserve its individual lines
+    // rather than leaving most of a page blank to preserve the whole block.
+    if (best < start + pageHeight * 0.85) best = retreat(target, lineRuns);
+    // No legal boundary exists for overlapping content taller than a page.
+    if (best <= start) best = target;
     boundaries.push(best);
     start = best;
   }
-
   return boundaries;
 }
 
@@ -603,7 +591,15 @@ async function encodeSmartPDF(frames, elements, job) {
 
   const seams = computeStitchBoundaries(frames, scale, frameHeight);
   const pageHeight = Math.max(100, Math.floor((width * A4_HEIGHT) / A4_WIDTH));
-  const boundaries = choosePageBreaks(totalHeight, pageHeight, elements, scale);
+  // Use geometry measured with the frame that supplies these screenshot rows.
+  const measured = frames.flatMap((frame, i) => (frame.breakHints || []).filter(hint =>
+    (hint.bottom - first.scroll) * scale > seams[i] &&
+    (hint.top - first.scroll) * scale < seams[i + 1]
+  ));
+  const hints = (measured.length ? measured : elements).map(hint => ({
+    ...hint, top: hint.top - first.scroll, bottom: hint.bottom - first.scroll,
+  }));
+  const boundaries = choosePageBreaks(totalHeight, pageHeight, hints, scale);
 
   // --- Minimal PDF writer -------------------------------------------------
   const encoder = new TextEncoder();
